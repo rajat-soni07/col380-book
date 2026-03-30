@@ -1,0 +1,355 @@
+\chapter{CUDA Synchronisations}
+
+\section{Shared-Memory Usage}
+
+
+\subsection{Overview}
+ 
+Having introduced the memory hierarchy of GPUs and the role of shared memory
+as a fast, programmer-managed scratchpad, the instructor turned to a concrete
+worked example: the \textbf{stencil based computation}. This example is a
+canonical shared-memory use case because it exhibits significant data reuse,
+each input element is accessed by multiple neighbouring threads, making it
+an ideal vehicle for demonstrating how a naive global-memory kernel can be
+transformed into an efficient shared-memory kernel.
+ 
+% ── Slide 1 ──────────────────────────────────────────────────────────────────
+\subsection{Stencil Computation: The Naive Global-Memory Kernel}
+
+ 
+\subsubsection{What Is a Stencil Computation?}
+ 
+A \textbf{stencil computation} is a grid-based computation in which the output
+at each grid point depends on the values of its neighbours. In the 1-D case,
+the output at index~$i$ depends on the elements at indices $i-1$, $i$, and
+$i+1$:
+ 
+\[
+  B[i] \;=\; A[i-1] + A[i] + A[i+1], \qquad 0 < i < N-1.
+\]
+ 
+Stencil computations are very common in scientific computing, examples
+include finite-difference solvers for partial differential equations and image
+processing filters. They also appear naturally in the matrix-transpose problem,
+another classic shared-memory exercise.
+ 
+\subsubsection{Naive Kernel: Direct Global-Memory Reads}
+ 
+The simplest possible CUDA implementation assigns one thread to each output
+element and reads the three needed input values directly from global memory:
+ 
+
+\begin{ppprogram}{Naive Implementation (Slide 8)}{lst:label}
+\begin{lstlisting}[language=C++]
+__global__ void stencil_naive(const float *A, float *B, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (i > 0 && i < N - 1) {
+        B[i] = A[i - 1] + A[i] + A[i + 1];
+    }
+}
+\end{lstlisting}
+\end{ppprogram}
+ 
+The guard \texttt{i > 0 \&\& i < N - 1} prevents out-of-bounds accesses at
+the two endpoints of the array.
+ 
+\subsubsection{Why Is This Naive?}
+ 
+Even though the computation is straightforward, the access pattern is highly
+inefficient. For each output element, three separate global-memory reads are
+issued. Crucially, the element \texttt{A[i]} that thread~$i$ reads as its
+``centre'' value is \emph{also} read by thread~$i-1$ (as its right neighbour)
+and by thread~$i+1$ (as its left neighbour). Every element is therefore read
+\textbf{three times from global memory}. With a global-memory latency of
+roughly 800 cycles, this redundancy is extremely costly.
+ 
+\begin{ppkey}
+  \\The insight motivating shared memory here is \textbf{locality and reuse}.
+  Although the L1 cache would capture some of this reuse automatically, it
+  cannot be \emph{relied upon}: the hardware's cache-replacement policy may
+  evict a line before all threads that need it have executed. Shared memory,
+  by contrast, is under explicit programmer control, so the data is guaranteed
+  to remain available for the entire duration of the block's computation.
+  Shared memory access latency is approximately 5--7 cycles versus
+  $\sim$800 cycles for global memory which is a two-order-of-magnitude improvement.
+\end{ppkey}
+ 
+\begin{ppnote}
+  \\\textbf{Student question:} Won't the L1 cache handle this automatically?\\[4pt]
+  \textbf{Instructor:} Yes, the L1 cache will be used, and for \emph{this}
+  specific example it would help. But the L1 cache is hardware-controlled with
+  primitive replacement logic, it cannot guarantee that overlapping accesses
+  from different threads remain resident. With shared memory you have explicit
+  control at programming time. The L1 cache is a useful backstop; shared
+  memory is a deliberate optimisation strategy. There are workloads where the
+  L1 cache simply would not suffice, and shared memory is the correct tool.
+\end{ppnote}
+ 
+\subsubsection{The Fix: Load a Window into Shared Memory}
+ 
+The solution is to \textbf{load a window of global memory into shared memory}
+before performing the stencil computation. Each thread block cooperatively
+loads the global-memory elements it needs into a shared array
+\texttt{sA[]}. Subsequent reads then hit shared memory instead of global
+memory.
+ 
+The window loaded must include not only the elements owned by the block's
+threads, but also the \textbf{halo} (or \textbf{ghost cell}) elements: the
+one element immediately to the left of the block's leftmost thread, and the
+one element immediately to the right of its rightmost thread. These boundary
+elements are required by the leftmost and rightmost threads of the block to
+complete their stencil computations, but they are \emph{owned} by adjacent
+blocks.
+
+\begin{figure}[!h]
+    \centering
+    \includegraphics[width=1\linewidth]{images/withhalo.png}
+    \caption{
+    Mapping of global memory array \texttt{A[]} to shared memory array \texttt{sA[]} 
+    in the \texttt{stencil\_shared} kernel for \texttt{blockDim.x = 6} and 
+    \texttt{blockIdx.x = 1}.
+    }
+    \label{fig:shared-mapping}
+    
+\end{figure}
+ 
+% ── Slide 2 ──────────────────────────────────────────────────────────────────
+\subsection{Loading Center Elements into Shared Memory}
+
+ 
+\subsubsection{Shared-Memory Array Layout}
+ 
+For a block of dimension \texttt{blockDim.x}, the shared array is declared
+with \textbf{two extra slots}, one on each side to accommodate the left and
+right halo elements:
+
+\begin{ppprogram}{Loading Center Elements (Slide 9)}{lst:label}
+\begin{lstlisting}[language=C++]
+__global__ void stencil_shared(const float *A, float *B, int N) {
+    __shared__ float sA[256 + 2];  // blockDim.x assumed 256;
+                                   // +2 for left and right halos
+ 
+    int tx = threadIdx.x;
+    int i  = blockIdx.x * blockDim.x + tx;
+ 
+    // Load center element: A[i] goes into sA[tx + 1]
+    // (index 0 is reserved for the left halo)
+    if (i < N) {
+        sA[tx + 1] = A[i];
+    }
+    ...
+\end{lstlisting}
+\end{ppprogram}
+
+This particular part of code is responsible for loading the center elements into the shared memory which are depicted by blue in Figure \ref{fig:shared-mapping}.
+ 
+The offset \texttt{tx + 1} is deliberate: index~0 of \texttt{sA[]} is
+reserved for the left halo element, so the thread-owned center elements occupy
+positions 1 through \texttt{blockDim.x}. The right halo will occupy position
+\texttt{blockDim.x + 1}.
+ 
+\subsubsection{Worked Example: \texttt{blockDim.x = 6}, \texttt{blockIdx.x = 1}}
+ 
+To make the indexing concrete, the instructor worked through the case
+\texttt{blockDim.x = 6} (chosen for clarity) and \texttt{blockIdx.x = 1}.
+The global indices for this block are:
+ 
+\[
+  i \;=\; 1 \times 6 + tx \;\in\; [6,\,11], \quad tx \in [0,5].
+\]
+ 
+The center-element load maps as follows:
+ \begin{figure}[!h]
+    \centering
+    \includegraphics[width=0.8\linewidth]{images/shared.png}
+    \label{fig:no-halo}
+    
+\end{figure}
+ 
+The slots \texttt{sA[0]} and \texttt{sA[7]} are left empty at this stage;
+they will be filled when the halo elements are loaded.
+
+% ── Slide 3 ──────────────────────────────────────────────────────────────────
+\subsection{Loading Halo Elements and Synchronising}
+
+ 
+\subsubsection{Why Halo Elements Are Needed}
+ 
+At the block boundary, the leftmost thread (\texttt{tx = 0}) of a block
+requires the element \texttt{A[i-1]}, which belongs to the \emph{last} thread
+of the preceding block. Similarly, the rightmost thread
+(\texttt{tx = blockDim.x - 1}) requires \texttt{A[i+1]}, owned by the
+\emph{first} thread of the following block. These boundary elements are called
+\textbf{halo regions} or \textbf{ghost cells}. They must be explicitly loaded
+into the shared array before the stencil computation can proceed.
+ 
+\subsubsection{Loading the Left Halo}
+ 
+Only the \emph{first thread} of a block (\texttt{tx == 0}) is responsible for
+loading the left halo. An additional guard \texttt{i > 0} prevents an
+out-of-bounds read when the block is the very first block in the grid (i.e.\
+\texttt{blockIdx.x == 0}), for which no left neighbour exists:
+ 
+\begin{ppprogram}{Load Left Halo (Slide 10)}{lst:label}
+\begin{lstlisting}[language=C++]
+// Load left halo
+if (tx == 0 && i > 0) {
+    sA[0] = A[i - 1];
+}
+\end{lstlisting}
+\end{ppprogram}
+
+The left halo loads as follows:
+ \begin{figure}[!h]
+    \centering
+    \includegraphics[width=0.8\linewidth]{images/sharedhalo.png}
+    \label{fig:one-halo}
+    
+\end{figure}
+ 
+\subsubsection{Loading the Right Halo}
+ 
+Symmetrically, only the \emph{last thread} of a block loads the right halo,
+guarded by \texttt{i < N - 1} to avoid reading past the end of the array:
+ 
+\begin{ppprogram}{Load Right Halo (Slide 10)}{lst:label}
+\begin{lstlisting}[language=C++]
+// Load right halo
+if (tx == blockDim.x - 1 && i < N - 1) {
+    sA[blockDim.x + 1] = A[i + 1];
+}
+\end{lstlisting}
+\end{ppprogram}
+
+After every thread has executed its center and halo loads, the shared array is fully populated and looks like Figure \ref{fig:shared-mapping}.
+ 
+\subsubsection{The Synchronisation Barrier: \texttt{\_\_syncthreads()}}
+ 
+After all center and halo elements have been written into \texttt{sA[]}, the
+shared array is fully populated. However, the writes are performed by
+different threads, which may execute at different speeds. Without an explicit
+synchronisation point, a thread could advance to the stencil computation phase
+and read a shared-memory slot that has not yet been written by the responsible
+thread, this rises a \textbf{race condition}.
+ 
+The solution is \texttt{\_\_syncthreads()}, placed immediately after all
+shared-memory stores:
+
+
+\begin{ppprogram}{Sync Barrier (Slide 10)}{lst:label}
+\begin{lstlisting}[language=C++]
+__global__ void stencil_shared(const float *A, float *B, int N) {
+    __shared__ float sA[256 + 2];   // blockDim.x assumed 256
+ 
+    int tx = threadIdx.x;
+    int i  = blockIdx.x * blockDim.x + tx;
+ 
+    // Phase 1: populate shared memory 
+    // Center element
+    if (i < N)
+        sA[tx + 1] = A[i];
+ 
+    // Left halo (only thread 0 of each non-first block)
+    if (tx == 0 && i > 0)
+        sA[0] = A[i - 1];
+ 
+    // Right halo (only last thread of each non-last block)
+    if (tx == blockDim.x - 1 && i < N - 1)
+        sA[blockDim.x + 1] = A[i + 1];
+ 
+    // Barrier: all shared-memory stores must complete 
+    __syncthreads();
+ 
+    // Phase 2: stencil computation using shared memory
+    if (i > 0 && i < N - 1)
+        B[i] = sA[tx] + sA[tx + 1] + sA[tx + 2];
+}
+\end{lstlisting}
+\end{ppprogram}
+ 
+Notice how the final computation replaces every global-memory read with a
+shared-memory read: \texttt{A[i-1]}, \texttt{A[i]}, \texttt{A[i+1]} become
+\texttt{sA[tx]}, \texttt{sA[tx+1]}, \texttt{sA[tx+2]}. This is the payoff
+for the setup work done in Phase~1.
+ 
+\subsubsection{Dual Role of \texttt{\_\_syncthreads()}}
+ 
+\texttt{\_\_syncthreads()} simultaneously provides two guarantees (from slide
+10):
+ 
+\begin{enumerate}
+  \item \textbf{Execution barrier.} No thread in the block may execute any
+        instruction beyond the \texttt{\_\_syncthreads()} call until
+        \emph{every} thread in the block has arrived at that call. This
+        prevents a fast thread from beginning Phase~2 while a slow thread is
+        still writing halo data in Phase~1.
+ 
+  \item \textbf{Memory-ordering fence.} All writes performed by any thread
+        \emph{before} the barrier are guaranteed to be visible to all threads
+        in the block \emph{after} the barrier. Without this fence, the
+        compiler or hardware could reorder or delay the visibility of the
+        shared-memory writes, even if every thread had nominally ``arrived''
+        at the barrier.
+\end{enumerate}
+ 
+\begin{ppkey}
+  \\The execution barrier and the memory fence are \emph{conceptually distinct}
+  guarantees, even though \texttt{\_\_syncthreads()} provides both in a single
+  call. An execution barrier alone merely ensures that all threads have
+  reached a certain point in the program; it does \emph{not} guarantee that
+  prior writes are committed and visible. The memory fence is the mechanism
+  that flushes pending writes into shared memory and makes them observable by
+  other threads. Both are required for the stencil kernel to be correct.
+\end{ppkey}
+ 
+\begin{ppnote}
+  \\\textbf{Student question:} Does \texttt{\_\_syncthreads()} also guarantee
+  that the shared memory is properly updated, i.e.\ that lazy or asynchronous
+  write-backs are flushed?\\[4pt]
+  \textbf{Instructor:} Yes, that is precisely the role of its memory-fence
+  semantics. An execution barrier alone says ``everyone has arrived here.''
+  But what if the writes were asynchronous, still sitting in a write buffer?
+  The memory fence says: ``every write that has happened before this barrier,
+  by any thread that has arrived, is now discharged into shared memory and
+  visible to all other threads in the block.'' Without the fence, you could
+  have all threads at the barrier but some reads in Phase~2 still seeing stale
+  values.
+\end{ppnote}
+ 
+\subsubsection{Performance Impact}
+ 
+Before the optimisation, each of the $N$ output elements required three
+global-memory reads at $\sim$800 cycles each. After the optimisation, Phase~1
+performs exactly $N + 2$ global-memory reads total (one center read per thread
+plus two halo reads at each block boundary), and Phase~2 performs three
+shared-memory reads at $\sim$5--7 cycles each. For large arrays the saving is
+close to a factor of three in global-memory traffic, with individual read
+latency reduced by two orders of magnitude.
+ 
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Summary of the Stencil Example}
+
+% ─────────────────────────────────────────────────────────────────────────────
+ 
+The stencil example demonstrates the complete shared-memory programming pattern:
+ 
+\begin{enumerate}
+  \item \textbf{Declare} a \texttt{\_\_shared\_\_} array sized to hold the
+        block's data plus halo slots.
+  \item \textbf{Load center elements}: each thread writes \texttt{A[i]} to
+        \texttt{sA[tx+1]}, offsetting by one to leave room for the left halo.
+  \item \textbf{Load halo elements}: the boundary threads of each block
+        additionally load the one element to the left (\texttt{sA[0]}) and
+        the one element to the right (\texttt{sA[blockDim.x + 1]}).
+  \item \textbf{Synchronise}: \texttt{\_\_syncthreads()} acts as both an
+        execution barrier and a memory fence, ensuring that every shared-memory
+        write is globally visible within the block before any thread proceeds.
+  \item \textbf{Compute}: replace all global-memory reads in the stencil
+        expression with the corresponding shared-memory reads.
+\end{enumerate}
+ 
+ 
+This pattern (\emph{load, synchronise, compute}) is the fundamental
+shared-memory idiom in CUDA and will reappear in matrix transpose, reductions,
+and other blocked algorithms.
