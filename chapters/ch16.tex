@@ -357,7 +357,7 @@ This pattern (\emph{load, synchronise, compute}) is the fundamental
 shared-memory idiom in CUDA and will reappear in matrix transpose, reductions,
 and other blocked algorithms.
 
-\section{Excercises}
+\subsection{Excercises}
 \begin{ppexercises}
 \ppexercise{%
   \textbf{Performance Analysis:} Assume \ppinline{blockDim.x = 256}, $N = 1,048,576$ ($= 2^{20}$), global-memory read latency $\approx 800$ cycles, and shared-memory read latency $\approx 6$ cycles.
