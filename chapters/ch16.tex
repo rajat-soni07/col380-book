@@ -1,5 +1,8 @@
 \chapter{CUDA Synchronisations}
 
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\synct}{\code{\_\_syncthreads()}}
+
 \section{Shared-Memory Usage}
 
 
@@ -353,3 +356,264 @@ The stencil example demonstrates the complete shared-memory programming pattern:
 This pattern (\emph{load, synchronise, compute}) is the fundamental
 shared-memory idiom in CUDA and will reappear in matrix transpose, reductions,
 and other blocked algorithms.
+
+\section{Excercises}
+\begin{ppexercises}
+\ppexercise{%
+  \textbf{Performance Analysis:} Assume \ppinline{blockDim.x = 256}, $N = 1,048,576$ ($= 2^{20}$), global-memory read latency $\approx 800$ cycles, and shared-memory read latency $\approx 6$ cycles.
+  
+  \begin{enumerate}[label=(\alph*)]
+    \item How many global-memory reads does the \emph{naive} kernel perform in total?
+    \item How many global-memory reads does the \emph{shared-memory} kernel perform in Phase 1? Count center reads and halo reads separately and give the total.
+    \item Compute the approximate total memory-access cost (in cycles) for both kernels and derive the theoretical speedup of the optimised kernel over the naive one, considering \emph{only} memory-read cycles.
+    \item In practice the measured speedup is often lower than the theoretical value. Give two reasons why.
+  \end{enumerate}
+}
+
+
+\ppexercise{%
+  \textbf{Radius-2 Stencil:} Generalise the 1-D stencil to a \textbf{radius-2} stencil:
+  \[ B[i] = A[i-2] + A[i-1] + A[i] + A[i+1] + A[i+2], \qquad 2 \leq i \leq N-3. \]
+
+  \begin{enumerate}[label=(\alph*)]
+    \item How large must the shared-memory array \ppinline{sA[]} be (in terms of \ppinline{blockDim.x})? Justify your answer.
+    \item How many halo elements are required on each side of the block?
+    \item Which threads should load the halo elements on the \emph{left} side? Write the corresponding \ppinline{if}-guarded load statements.
+    \item Write the complete \ppinline{stencil\_r2} kernel that implements the radius-2 stencil using shared memory. Your solution must include all halo loads, the synchronisation barrier, and the stencil computation.
+  \end{enumerate}
+}
+
+\ppexercise{%
+  \textbf{2-D Stencil with Shared Memory:} A \textbf{2-D stencil} computes the plus-shaped (von Neumann) stencil:
+  \[ B[r][c] = A[r-1][c] + A[r][c-1] + A[r][c] + A[r][c+1] + A[r+1][c] \]
+  for all interior elements $1 \leq r \leq R-2, 1 \leq c \leq C-2$.
+
+  \begin{enumerate}[label=(\alph*)]
+    \item Using a 2-D thread block of size $T_x \times T_y$, how large must the shared-memory tile be in each dimension to accommodate halo elements on all four sides?
+    \item Write pseudo-code (or full CUDA code) that loads the interior and halo elements into shared memory. Clearly state which threads are responsible for each of the four halo edges.
+    \item Write the complete \ppinline{stencil\_2d} kernel, including all halo loads, boundary guards, \ppinline{\_\_syncthreads()}, and the stencil computation.
+    \item How does the placement and purpose of \ppinline{\_\_syncthreads()} in the 2-D kernel compare with the 1-D case? Are there any additional concerns?
+  \end{enumerate}
+}
+
+\end{ppexercises}
+
+\section*{Solutions}
+
+\subsubsection{Solution 1}
+\begin{enumerate}[label=(\alph*)]
+  \item \textbf{Naive kernel.}  The guard {i > 0 \&\& i < N-1}
+        disables 2 threads, leaving $N - 2 \approx N$ active threads, each
+        issuing 3 global-memory reads:
+        \[
+          \text{Total reads} \;=\; 3(N-2) \;\approx\; 3N
+          \;=\; 3 \times 1{,}048{,}576 \;\approx\; 3.15 \times 10^{6}.
+        \]
+
+  \item \textbf{Shared-memory kernel, Phase~1.}
+        \begin{itemize}
+          \item \emph{Center reads:} one per thread $\Rightarrow N$ reads.
+          \item \emph{Halo reads:} 2 per block (one left, one right)
+                $\Rightarrow 2 \times \dfrac{N}{\text{blockDim.x}}
+                = 2 \times \dfrac{1{,}048{,}576}{256} = 8{,}192$ reads.
+        \end{itemize}
+        \[
+          \text{Total Phase-1 global reads}
+          \;=\; N + 8{,}192 \;\approx\; 1.056 \times 10^{6}.
+        \]
+        Phase~2 reads exclusively from shared memory.
+
+  \item \textbf{Cycle cost comparison.}
+        \begin{align*}
+          C_{\text{naive}}
+            &= 3N \times 800
+             \approx 2.516 \times 10^{9} \text{ cycles.}\\[4pt]
+          C_{\text{opt, global}}
+            &= (N + 8{,}192) \times 800
+             \approx 8.453 \times 10^{8} \text{ cycles.}\\
+          C_{\text{opt, shared}}
+            &= 3N \times 6
+             \approx 1.887 \times 10^{7} \text{ cycles.}\\[2pt]
+          C_{\text{opt, total}}
+            &\approx 8.453 \times 10^{8} + 1.887 \times 10^{7}
+             \approx 8.642 \times 10^{8} \text{ cycles.}
+        \end{align*}
+        \[
+          \boxed{\text{Theoretical speedup}
+          = \frac{C_{\text{naive}}}{C_{\text{opt, total}}}
+          = \frac{2.516 \times 10^{9}}{8.642 \times 10^{8}}
+          \approx 2.91\times.}
+        \]
+
+  \item Two practical reasons the measured speedup is lower:
+        \begin{enumerate}[label=\roman*.]
+          \item \textbf{Memory-level parallelism and coalescing.}  The GPU
+                memory controller can service many outstanding requests in
+                parallel.  The naive kernel's accesses are often coalesced
+                within a warp, so the effective per-access penalty is well
+                below 800 cycles, narrowing the gap between the two kernels.
+          \item \textbf{Phase~1 overhead.}  Loading halo elements, executing
+                the synchronisation barrier, and the additional index
+                arithmetic all consume cycles not present in the naive
+                kernel.  For small arrays or well-cached workloads these
+                overheads can dominate the saving.
+        \end{enumerate}
+\end{enumerate}
+
+
+\subsubsection{Solution 2}
+
+\begin{enumerate}[label=(\alph*)]
+  \item For stencil radius $r = 2$, each block needs $r$ halo elements on
+        each side, so the shared array must hold:
+        \[
+          \code{blockDim.x} + 2r \;=\; \code{blockDim.x} + 4 \text{ elements.}
+        \]
+        Declared as \code{\_\_shared\_\_ float sA[256 + 4];} (for
+        \code{blockDim.x = 256}).
+
+  \item There are \textbf{2} halo elements required on each side.
+
+  \item The two threads with the smallest \code{tx} values load the left
+        halo.  Using the same offset-by-$R$ convention as the center load
+        (center element for thread \code{tx} goes to \code{sA[tx + R]}):
+\begin{lstlisting}
+// Left halo: two elements to the left of the block's range
+if (tx == 0 && i >= 1)
+    sA[R - 1] = A[i - 1];   // one step left
+if (tx == 1 && i >= 2)
+    sA[R - 2] = A[i - 2];   // two steps left
+\end{lstlisting}
+        Thread~1 loads the element further to the left (\code{A[i-2]});
+        the guard \code{i >= 2} prevents an out-of-bounds read for blocks
+        near the start of the array.
+
+  \item Complete kernel:
+\begin{lstlisting}
+__global__ void stencil_r2(const float *A, float *B, int N) {
+    const int R = 2;
+    __shared__ float sA[256 + 2*R];  // blockDim.x = 256
+
+    int tx = threadIdx.x;
+    int i  = blockIdx.x * blockDim.x + tx;
+
+    // Phase 1: populate shared memory
+    // Center element (offset by R to reserve left halo slots)
+    if (i < N)
+        sA[tx + R] = A[i];
+
+    // Left halo (2 elements, loaded by first two threads)
+    if (tx == 0 && i >= 1)
+        sA[R - 1] = A[i - 1];
+    if (tx == 1 && i >= 2)
+        sA[R - 2] = A[i - 2];
+
+    // Right halo (2 elements, loaded by last two threads)
+    if (tx == blockDim.x - 1 && i <= N - 2)
+        sA[tx + R + 1] = A[i + 1];
+    if (tx == blockDim.x - 2 && i <= N - 3)
+        sA[tx + R + 2] = A[i + 2];
+
+    // Synchronisation barrier
+    __syncthreads();
+
+    // Phase 2: stencil computation from shared memory
+    // sA[tx]   = A[i-2],  sA[tx+1] = A[i-1],  sA[tx+2] = A[i]
+    // sA[tx+3] = A[i+1],  sA[tx+4] = A[i+2]
+    if (i >= R && i <= N - R - 1)
+        B[i] = sA[tx] + sA[tx+1] + sA[tx+2]
+             + sA[tx+3] + sA[tx+4];
+}
+\end{lstlisting}
+\end{enumerate}
+
+
+\subsubsection{Solution 3}
+
+\begin{enumerate}[label=(\alph*)]
+  \item For a block of size $T_x \times T_y$, one halo layer is needed on
+        each side in both dimensions:
+        \[
+          (T_x + 2) \times (T_y + 2) \text{ elements.}
+        \]
+        Declared as
+        \code{\_\_shared\_\_ float sA[Ty + 2][Tx + 2]}.
+
+  \item The four halo edges are assigned as follows:
+        \begin{itemize}
+          \item \textbf{Top edge} (\code{ty == 0}): loads the row directly
+                above the block, i.e.\ \code{A[(r-1)*C + c]}.
+          \item \textbf{Bottom edge} (\code{ty == blockDim.y - 1}): loads
+                the row directly below, \code{A[(r+1)*C + c]}.
+          \item \textbf{Left edge} (\code{tx == 0}): loads the column
+                immediately to the left, \code{A[r*C + (c-1)]}.
+          \item \textbf{Right edge} (\code{tx == blockDim.x - 1}): loads
+                the column immediately to the right, \code{A[r*C + (c+1)]}.
+        \end{itemize}
+        The four \emph{corner} positions (\code{sA[0][0]},
+        \code{sA[0][Tx+1]}, etc.) are not needed by the plus-shaped stencil
+        and need not be loaded.
+
+  \item Complete kernel (tile size $T = 16$):
+\begin{lstlisting}
+#define T 16
+__global__ void stencil_2d(const float *A, float *B,
+                            int R, int C) {
+    // Shared tile: (T+2) x (T+2), one halo layer on each side
+    __shared__ float sA[T + 2][T + 2];
+
+    int tx = threadIdx.x,  ty = threadIdx.y;
+    int r  = blockIdx.y * blockDim.y + ty;   // global row
+    int c  = blockIdx.x * blockDim.x + tx;   // global col
+
+    // Phase 1: load centre and halo into shared memory
+
+    // Centre element (offset by 1 in both dims for halo room)
+    if (r < R && c < C)
+        sA[ty + 1][tx + 1] = A[r * C + c];
+
+    // Top halo
+    if (ty == 0 && r > 0)
+        sA[0][tx + 1] = A[(r - 1) * C + c];
+
+    // Bottom halo
+    if (ty == blockDim.y - 1 && r < R - 1)
+        sA[blockDim.y + 1][tx + 1] = A[(r + 1) * C + c];
+
+    // Left halo
+    if (tx == 0 && c > 0)
+        sA[ty + 1][0] = A[r * C + (c - 1)];
+
+    // Right halo
+    if (tx == blockDim.x - 1 && c < C - 1)
+        sA[ty + 1][blockDim.x + 1] = A[r * C + (c + 1)];
+
+    // Synchronisation barrier
+    __syncthreads();
+
+    // Phase 2: stencil computation from shared memory
+    if (r > 0 && r < R - 1 && c > 0 && c < C - 1)
+        B[r * C + c] = sA[ty][tx + 1]       // above
+                     + sA[ty + 1][tx]        // left
+                     + sA[ty + 1][tx + 1]    // centre
+                     + sA[ty + 1][tx + 2]    // right
+                     + sA[ty + 2][tx + 1];   // below
+}
+\end{lstlisting}
+
+  \item \synct{} is placed and used in \textbf{exactly the same way} as
+        in the 1-D case: one barrier between Phase~1 (all shared-memory
+        stores) and Phase~2 (all shared-memory loads).  The principle is
+        identical — every thread must have finished writing before any
+        thread begins reading.
+
+        The key \textbf{additional concern} in 2-D is that far more threads
+        contribute halo stores.  In 1-D only 2 threads per block load halo
+        data; in 2-D, entire \emph{edge rows and columns} of threads do so.
+        If any one of those edge threads is delayed and \synct{} were
+        absent, a fast interior thread could read a stale halo value and
+        produce a wrong result.  The barrier is therefore even more critical
+        in 2-D, as the set of writes that must be flushed before computation
+        begins is significantly larger.
+\end{enumerate}
+
