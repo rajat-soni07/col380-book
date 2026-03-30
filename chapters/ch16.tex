@@ -617,3 +617,605 @@ __global__ void stencil_2d(const float *A, float *B,
         begins is significantly larger.
 \end{enumerate}
 
+\section{Common Mistakes in Shared Memory}
+\label{sec:common-mistakes}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Overview}
+
+Having worked through the stencil example that demonstrated \emph{how} shared
+memory is used correctly (see slides 8--10, reproduced as
+Figure~\ref{fig:stencil-shared-mapping} below), the instructor turned to a
+catalogue of errors that programmers frequently commit when writing
+shared-memory CUDA kernels.
+
+\begin{figure}[!h]
+    \centering
+    \includegraphics[width=0.7\linewidth]{images/shared.png}
+    \includegraphics[width=0.7\linewidth]{images/sharedhalo.png}
+    \caption{
+    Mapping of global memory array \texttt{A[]} to shared memory array \texttt{sA[]} 
+    in the \texttt{stencil\_shared} kernel for \texttt{blockDim.x = 6} and 
+    \texttt{blockIdx.x = 1}. Threads with indices $tx \in [0,5]$ load the central 
+    elements $\texttt{A}[i]$ into $\texttt{sA}[tx+1]$ for $i \in [6,11]$. 
+    Additionally, halo elements are loaded such that $\texttt{sA}[0] = \texttt{A}[5]$ 
+    (left halo) and $\texttt{sA}[7] = \texttt{A}[12]$ (right halo). 
+    A synchronization barrier (\texttt{\_\_syncthreads()}) ensures all data is 
+    available before performing the stencil computation.
+    }
+    \label{fig:stencil-shared-mapping}
+    
+\end{figure}
+
+% ── 5.1 ──────────────────────────────────────────────────────────────────────
+\subsection{Mistake 1: Using Shared Memory When There Is No Data Reuse}
+\label{subsec:no-reuse}
+
+Shared memory is a fast, on-chip resource whose primary purpose is to
+\emph{eliminate redundant reads from global memory} when multiple threads
+within a block access the same data element. If a particular data element
+stored in shared memory is \emph{not} going to be reused across multiple
+threads in the computation, there is no benefit to placing it in shared
+memory.
+
+\begin{ppkey}
+  \\The justification for using shared memory is \textbf{reuse}: when many
+  threads read the same element, staging it in shared memory turns $k$ slow
+  global-memory reads into one global-memory read plus $k$ fast shared-memory
+  reads. Shared memory also serves as an \emph{inter-thread communication
+  channel} --- threads in the same block can write results into shared memory
+  and have other threads read them, which is itself a form of reuse. \textbf{No
+  reuse~$\Rightarrow$ no need for shared memory.}
+\end{ppkey}
+
+\begin{pppitfall}
+  \\Many programmers reflexively place data in shared memory even when there is
+  no reuse in their computation. This wastes a scarce, hardware-limited
+  resource without any performance benefit.
+\end{pppitfall}
+
+% ── 5.2 ──────────────────────────────────────────────────────────────────────
+\subsection{Mistake 2: Forgetting \texttt{\_\_syncthreads()} and Introducing
+Race Conditions}
+\label{subsec:forgotten-sync}
+
+After data is written into shared memory by one thread, other threads that
+subsequently read that location must be guaranteed to see the written value.
+Without an explicit \texttt{\_\_syncthreads()} barrier between the write and
+the read phases, the execution order of threads within a block is
+non-deterministic, and a thread may read stale or uninitialised data.
+
+\begin{pppitfall}
+  \\Omitting \texttt{\_\_syncthreads()} after shared-memory writes creates a
+  \textbf{race condition}: a reading thread may execute before the writing
+  thread has completed its store. The bug is typically non-deterministic and
+  may only manifest on certain GPU generations or under certain occupancy
+  conditions.
+\end{pppitfall}
+
+The stencil example illustrates the canonical usage pattern:
+
+\begin{ppprogram}{Correct use of \texttt{\_\_syncthreads()} in the
+stencil kernel (from lecture slide 10).}{lst:label}
+\begin{lstlisting}
+// --- Phase 1: load halo elements into shared memory ---
+if (tx == 0 && i > 0)
+    sA[0] = A[i - 1];               // left halo
+
+if (tx == blockDim.x - 1 && i < N - 1)
+    sA[blockDim.x + 1] = A[i + 1];  // right halo
+
+__syncthreads();   // <-- barrier: all shared-memory writes MUST be
+                   //     visible to all threads before continuing
+
+// --- Phase 2: compute stencil using shared memory ---
+if (i > 0 && i < N - 1)
+    B[i] = sA[tx] + sA[tx + 1] + sA[tx + 2];
+\end{lstlisting}
+\end{ppprogram}
+
+\texttt{\_\_syncthreads()} acts as both an \textbf{execution barrier} (no
+thread advances past the call until all threads in the block have reached it)
+and a \textbf{memory-ordering fence} (all writes performed by all threads
+before the barrier are guaranteed to be visible to all threads after the
+barrier).
+
+% ── 5.3 ──────────────────────────────────────────────────────────────────────
+\subsection{Mistake 3: Allocating Too Much Shared Memory Per Block ---
+Reducing SM Occupancy}
+\label{subsec:sm-occupancy}
+
+Each Streaming Multiprocessor (SM) has a fixed, hardware-limited pool of
+shared memory. On modern GPUs such as the A100 or H100, an SM can schedule up
+to 32 concurrent thread blocks. The shared memory consumed by \emph{each} block
+is deducted from the SM's total pool. If a single block requests a large amount
+of shared memory, fewer blocks can co-reside on the SM simultaneously.
+
+\begin{ppkey}
+  \\\textbf{SM occupancy} is the ratio of the number of active warps to the
+  maximum number of warps an SM can support. Low occupancy means the SM has
+  fewer warps available to hide memory-access latency, which directly harms
+  throughput. The limiting resource can be registers, shared memory, or the
+  maximum block count --- whichever is exhausted first.
+\end{ppkey}
+
+\begin{ppexample}
+  \\Suppose an SM supports up to 32 concurrent
+  blocks and has 48\,KB of shared memory. If each block allocates 24\,KB, then
+  only $\lfloor 48\,\text{KB} / 24\,\text{KB} \rfloor = 2$ blocks can be
+  scheduled concurrently, regardless of whether register pressure or other limits
+  would otherwise allow more. The programmer should therefore profile and
+  experiment with shared-memory allocation size to find the sweet spot between
+  data reuse and occupancy.
+\end{ppexample}
+
+% ── 5.4 ──────────────────────────────────────────────────────────────────────
+\subsection{Mistake 4: Bank Conflicts}
+\label{subsec:bank-conflicts}
+
+\subsubsection{How Shared Memory Is Organised in Hardware}
+
+Shared memory is not a single monolithic array; it is physically divided into
+\textbf{banks} (also referred to as \emph{streams} during the lecture). On
+NVIDIA GPUs there are typically \textbf{32 banks}. Memory addresses are
+interleaved across banks in a round-robin fashion: address~0 resides in
+bank~0, address~1 in bank~1, \ldots, address~31 in bank~31, address~32 back
+in bank~0, and so on. All banks can be accessed \emph{simultaneously} in a
+single cycle, providing the high bandwidth that makes shared memory fast.
+
+\begin{figure}[!h]
+    \centering
+    \includegraphics[width=0.75\linewidth]{images/examples-of-strided-shared-memory-accesses.png}
+    \caption{
+    access patterns for stride 1, 2 and 3
+    }
+    \label{fig:shared-memory-banks}
+\end{figure}
+\subsubsection{What Is a Bank Conflict?}
+
+A \textbf{bank conflict} occurs when two or more threads within the same warp
+attempt to access \emph{different addresses that map to the same bank} in the
+same memory transaction. Because each bank can service only one address per
+cycle, conflicting accesses must be \emph{serialised} --- the parallelism of
+the warp is lost for that access. Two conflicting accesses become two serial
+accesses; $n$-way conflicts result in $n$ serial accesses.
+
+\begin{pppitfall}
+  \\Even though the threads are logically concurrent, bank conflicts cause their
+  memory accesses to be \textbf{serialised} at the hardware level. This
+  eliminates the bandwidth advantage of shared memory and can severely degrade
+  kernel performance.
+\end{pppitfall}
+
+\subsubsection{Stride and Bank Conflicts}
+
+The access pattern that determines whether conflicts occur is characterised by
+the \textbf{stride} --- the distance (in elements) between the locations
+accessed by successive threads:
+
+\begin{itemize}
+  \item \textbf{Stride 1} (consecutive): thread $i$ accesses element $k$,
+        thread $i+1$ accesses element $k+1$, etc. Each thread accesses a
+        distinct bank. \emph{No conflicts.}
+  \item \textbf{Stride $s$}: thread $i$ accesses element $k$, thread $i+1$
+        accesses element $k + s$. If $s$ is a divisor of the number of banks
+        (e.g.\ stride 2 with 32 banks), every other bank is skipped, and
+        pairs of threads collide on the same bank. \emph{2-way conflict.}
+  \item \textbf{Stride 32} (or any multiple of 32): all 32 threads in a warp
+        map to the \emph{same} bank. \emph{32-way conflict --- fully
+        serialised.}
+\end{itemize}
+
+The instructor noted that the exact bank-allocation policy is
+\emph{proprietary} for NVIDIA hardware, but that OpenCL documentation provides
+a publicly accessible description of the analogous mechanism. The general
+principle --- contiguous elements map to successive banks in a round-robin
+manner --- holds across vendors.
+
+\begin{ppnote}
+  \\\textbf{Student question:} How are banks actually allocated today?\\[4pt]
+  \textbf{Instructor:} The detailed allocation policy is hardware-specific and
+  largely proprietary for NVIDIA. In OpenCL it is documented more openly, and
+  the intuitive model is round-robin: $A[0]$ in stream/bank~1, $A[1]$ in
+  bank~2, $\ldots$, and once the banks are exhausted it wraps back around. So
+  if your stride of access is~1, each successive thread hits a different bank
+  --- no conflict. Some conflicts are \emph{inevitable} depending on the
+  workload, but the programmer's obligation is to \emph{minimise} them by
+  choosing the stride of access wisely. Changing the stride is within the
+  programmer's control; the number of banks is fixed by the hardware engineers.
+  This is a core GPU optimisation strategy.
+\end{ppnote}
+
+\subsubsection{Relationship to False Sharing in CPU Caches}
+
+The instructor drew a direct analogy with \emph{false sharing} in CPU cache
+systems. In a CPU cache, two threads updating different variables that happen
+to reside on the same cache line cause that line to be repeatedly invalidated.
+In shared memory the invalidation mechanism does not apply, but the outcome is
+similar: concurrent accesses that fall on the same bank are \emph{serialised},
+eliminating the benefit of concurrent execution.
+
+
+% ─────────────────────────────────────────────────────────────────────────────
+\newpage
+\section{Synchronisation Primitives}
+\label{sec:sync-primitives}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Overview}
+
+CUDA provides a hierarchy of synchronisation primitives that operate at
+different scopes: the warp, the thread block, the device, and the entire
+system (device~+~host). Choosing the right primitive is important for both
+correctness and performance --- using a coarser primitive than necessary wastes
+cycles; using a finer one than required introduces data races.
+
+The instructor categorised the primitives into two families:
+
+\begin{enumerate}[noitemsep]
+  \item \textbf{Execution barriers} --- every participating thread must arrive
+        at the barrier before any may proceed.
+  \item \textbf{Memory fence primitives} --- flush the calling thread's pending
+        writes to the appropriate visibility scope, \emph{without} blocking
+        execution of other threads.
+\end{enumerate}
+
+% ── 6.1 ──────────────────────────────────────────────────────────────────────
+\subsection{\texttt{\_\_syncwarp()}: Warp-Level Synchronisation}
+\label{subsec:syncwarp}
+
+\subsubsection{Background: Warp Execution and Independent Thread Scheduling}
+
+Historically, threads within a warp were said to execute in \emph{lock-step}:
+all 32 lanes issue and retire the same instruction simultaneously. Under pure
+lock-step semantics, a write by lane~$i$ followed by a read by lane~$j$ within
+the same warp required no explicit synchronisation, because the write always
+completes before the read begins.
+
+Modern GPU architectures (Volta and later) introduced \textbf{Independent
+Thread Scheduling} (ITS): the hardware may schedule threads within a warp with
+different latencies and may interleave their execution. The lock-step guarantee
+no longer holds in general, and programs that relied on it silently can now
+exhibit incorrect behaviour.
+
+\begin{ppkey}
+  \\\texttt{\_\_syncwarp()} was introduced \emph{because} ITS broke the implicit
+  lock-step synchronisation assumption. If the hardware truly enforced lock-step
+  execution for every warp without exception, there would be no reason to
+  provide the primitive. Its existence is the hardware's acknowledgement that
+  the assumption can be violated.
+\end{ppkey}
+
+\begin{ppnote}
+  \\\textbf{Student question:} If warps execute in lock-step, why do we need
+  \texttt{\_\_syncwarp} at all?\\[4pt]
+  \textbf{Instructor:} Modern GPUs perform independent thread scheduling and
+  other optimisations that break the strict lock-step semantics. If the hardware
+  did not have that feature at all, there would be no reason to provide
+  \texttt{\_\_syncwarp}. Its presence in the API is itself the signal that the
+  lock-step assumption can no longer be taken for granted.
+\end{ppnote}
+
+\subsubsection{Semantics}
+
+\texttt{\_\_syncwarp()} acts as \emph{both} an \textbf{execution barrier}
+(threads within the warp wait for each other at this point) and a
+\textbf{memory fence} (prior writes become visible to all lanes in the warp).
+Its cost is much lower than \texttt{\_\_syncthreads()} because it operates
+only within a single warp of 32 threads.
+
+\subsubsection{Typical Use Pattern}
+
+Use \texttt{\_\_syncwarp()} when:
+\begin{itemize}[noitemsep]
+  \item The computation involves only the 32 threads of a single warp (and
+        additional threads are either absent or idle).
+  \item Work is split into a \emph{write phase} followed by a \emph{read
+        phase} within the same warp.
+  \item A full \texttt{\_\_syncthreads()} would be correct but unnecessarily
+        expensive.
+\end{itemize}
+
+The following listing reproduces the example from slide~12:
+
+\begin{ppprogram}{\texttt{\_\_syncwarp()} example: warp-level
+prefix sum (from lecture slide 12).}{lst:label}
+\begin{lstlisting}
+int lane = threadIdx.x % 32;
+
+// Only the first warp (threads 0..31) participates
+if (threadIdx.x < 32) {
+    s[lane] = A[lane];   // Phase 1: each lane loads one element
+
+    __syncwarp();         // Barrier + fence within the warp
+                          // Ensures all loads complete before reads below
+
+    if (lane > 0)
+        B[lane] = s[lane] + s[lane - 1];  // Phase 2: read neighbour's value
+}
+\end{lstlisting}
+\end{ppprogram}
+
+\begin{ppkey}
+  \\The predicate \texttt{if (threadIdx.x < 32)} restricts the computation to
+  the first warp. This is intentional: because \texttt{s[]} is in shared
+  memory and $s[\text{lane} - 1]$ is written by a \emph{different} lane, the
+  two phases must be separated by a synchronisation point. Within the first
+  warp, \texttt{\_\_syncwarp()} is cheaper than \texttt{\_\_syncthreads()}.
+\end{ppkey}
+
+% ── 6.2 ──────────────────────────────────────────────────────────────────────
+\subsection{\texttt{\_\_syncthreads()}: Block-Level Synchronisation}
+\label{subsec:syncthreads}
+
+\texttt{\_\_syncthreads()} is the most commonly used synchronisation barrier
+in CUDA. It establishes a rendezvous point for \emph{all} threads in a thread
+block: no thread may execute instructions beyond the barrier until every thread
+in the block has arrived.
+
+\subsubsection{Semantics (from slide 10)}
+
+\begin{itemize}
+  \item \textbf{Execution barrier:} Every thread in the block waits at the
+        barrier. No thread advances until all threads have reached it.
+  \item \textbf{Memory ordering:} All writes by all threads before the barrier
+        are guaranteed to be visible to all threads in the block after the
+        barrier. This covers both shared memory and global memory accesses.
+\end{itemize}
+
+\subsubsection{Typical Use: Phased Computation}
+
+The canonical pattern is a computation that proceeds in two or more phases,
+where phase~$k+1$ depends on results produced in phase~$k$ by \emph{all}
+threads:
+
+\begin{ppprogram}{Canonical two-phase shared-memory pattern using
+\texttt{\_\_syncthreads()}.}{lst:label}
+\begin{lstlisting}
+// Phase 1: all threads populate shared memory
+sA[tx + 1] = A[i];
+if (tx == 0 && i > 0)            sA[0]            = A[i - 1];
+if (tx == blockDim.x - 1 && i < N - 1) sA[blockDim.x + 1] = A[i + 1];
+
+__syncthreads();   // <-- all phase-1 writes must be complete before
+                   //     any thread reads sA[] in phase 2
+
+// Phase 2: all threads read from shared memory
+if (i > 0 && i < N - 1)
+    B[i] = sA[tx] + sA[tx + 1] + sA[tx + 2];
+\end{lstlisting}
+\end{ppprogram}
+
+\subsubsection{When \emph{Not} to Use \texttt{\_\_syncthreads()}}
+
+The instructor emphasised three situations in which \texttt{\_\_syncthreads()}
+must \emph{not} be used (from slide 13):
+
+\paragraph{1. When threads are completely independent.}
+If no thread in the block reads data written by another thread, no
+synchronisation is necessary. Adding an unnecessary \texttt{\_\_syncthreads()}
+wastes cycles waiting for all threads to arrive.
+
+\paragraph{2. When only one warp is involved.}
+Within a single warp, ITS aside, the hardware provides execution ordering at a
+finer granularity. Use \texttt{\_\_syncwarp()} instead --- it is cheaper.
+
+\paragraph{3. Inside a divergent control flow.}
+\texttt{\_\_syncthreads()} \emph{must} be reached by \textbf{all} threads in
+the block, unconditionally. Placing it inside a conditional branch where some
+threads take the \texttt{then} path and others take the \texttt{else} path
+results in \emph{deadlock or undefined behaviour}.
+
+\begin{pppitfall}
+  \\The following code is \textbf{incorrect}:
+\begin{lstlisting}[numbers=none]
+if (threadIdx.x < 128) {
+    __syncthreads();   // WRONG: threads 128..blockDim.x-1 never reach here
+}
+\end{lstlisting}
+  Only the first 128 threads call \texttt{\_\_syncthreads()}; the remaining
+  threads do not. The barrier can never be satisfied and the kernel hangs
+  (or produces undefined results, depending on the GPU generation).
+\end{pppitfall}
+
+\begin{ppnote}
+  \\\textbf{Student question:} Should \texttt{\_\_syncthreads()} also be
+  accompanied by \texttt{\_\_threadfence\_block()} to ensure visibility?\\[4pt]
+  \textbf{Instructor:} \texttt{\_\_syncthreads()} is implemented to do both
+  jobs internally --- it acts as an execution barrier \emph{and} a memory
+  fence at the block scope. You do not need to call
+  \texttt{\_\_threadfence\_block()} separately when you use
+  \texttt{\_\_syncthreads()}.
+\end{ppnote}
+
+% ── 6.3 ──────────────────────────────────────────────────────────────────────
+\subsection{Memory Fence Primitives}
+\label{subsec:threadfence}
+
+Memory fence primitives differ fundamentally from execution barriers:
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{Property} & \textbf{Execution Barrier} & \textbf{Memory Fence} \\
+  \midrule
+  Blocks calling thread? & Yes --- waits for others & No \\
+  Blocks other threads? & Yes --- until all arrive & No \\
+  Guarantees visibility? & Yes & Yes (for calling thread's \\&&writes only) \\
+  Scope & All threads in group & Configurable \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+A memory fence causes the \emph{calling thread's} prior writes to become
+visible to threads in the specified scope. It does \emph{not} wait for other
+threads to reach the same point.
+
+\begin{ppkey}
+  \\Use a memory fence when you have determined, through analysis of your
+  algorithm, that only \emph{some} threads need to observe a subset of writes,
+  and a full barrier would stall threads unnecessarily. This gives finer-grained
+  control than \texttt{\_\_syncthreads()} but demands a deeper understanding of
+  the data-flow in the kernel.
+\end{ppkey}
+
+The instructor cautioned that memory fences are powerful but error-prone: used
+incorrectly, they \emph{can} introduce data races by giving the programmer the
+illusion of synchronisation while leaving some reads unsatisfied.
+
+\subsubsection{\texttt{\_\_threadfence\_block()}}
+
+
+\textbf{Scope:} The calling thread's prior writes become visible to all other
+threads in the \emph{same block}, wherever they are in the control flow.
+This is a strict subset of what \texttt{\_\_syncthreads()} provides: it does
+not stall the calling thread and does not wait for other threads.
+
+\paragraph{Example use case.}
+Consider a reduction within a block where only thread~0 produces a final
+result. After thread~0 writes the result to shared memory, calling
+\texttt{\_\_threadfence\_block()} ensures that other threads in the block will
+subsequently see the updated value, without requiring a full barrier.
+
+\subsubsection{\texttt{\_\_threadfence()}}
+
+
+
+\textbf{Scope:} The calling thread's prior writes become visible to \emph{all
+threads on the device}, regardless of which block they belong to. This is the
+device-wide memory fence.
+
+\paragraph{Example use case.}
+When a kernel uses a global flag or counter that one block writes and another
+block reads (e.g.\ in a hand-written reduction across blocks), calling
+\texttt{\_\_threadfence()} after writing the flag ensures that any thread on
+the device that subsequently reads the flag will see the updated value.
+
+\begin{ppnote}
+  \\\textbf{Instructor (unprompted):} In most GPU programs you will not see
+  \texttt{\_\_threadfence}. It is a very powerful primitive, but the power it
+  gives you also means that if you use it incorrectly, you may introduce data
+  races. What the fence does is reflect all writes that have happened in the
+  past by the calling thread into the appropriate memory scope --- it does not
+  by itself prevent another thread from concurrently writing to the same
+  location. You still have to reason carefully about your algorithm.
+\end{ppnote}
+
+\subsubsection{\texttt{\_\_threadfence\_system()}}
+
+
+\textbf{Scope:} The calling thread's prior writes become visible not only to
+all threads on the device but also to \emph{threads on the host (CPU)}.
+Internally, this requires a \textbf{device-to-host data transfer} to flush
+the GPU write buffers through the PCIe bus and into host-visible memory.
+
+\begin{pppitfall}
+  \\\texttt{\_\_threadfence\_system()} is the most expensive memory primitive in
+  the CUDA hierarchy. Because it triggers a device-to-host transfer for every
+  calling thread that executes it, it should be used only when a GPU thread
+  genuinely needs to signal the CPU, not as a general-purpose fence.
+\end{pppitfall}
+
+
+
+% ── 6.4 ──────────────────────────────────────────────────────────────────────
+\subsection{Choosing the Right Primitive: Decision Heuristics}
+\label{subsec:choosing}
+
+The following heuristics, drawn from the lecture discussion, guide the
+selection of the appropriate primitive:
+
+\begin{enumerate}
+  \item \textbf{Are the threads completely independent?} Use no primitive.
+        Adding any synchronisation where it is not needed only wastes cycles.
+
+  \item \textbf{Is the computation confined to one warp?} Use
+        \texttt{\_\_syncwarp()} instead of \texttt{\_\_syncthreads()}. The
+        latter is a ``heavy hammer'' when only 32 threads are involved.
+
+  \item \textbf{Do all threads in the block participate, in phases?} Use
+        \texttt{\_\_syncthreads()}.
+
+  \item \textbf{Only some threads write; others need to observe those
+        writes --- but no full rendezvous is needed?} Consider
+        \texttt{\_\_threadfence\_block()}. Ensure that the reading threads
+        will actually execute \emph{after} the fence (e.g.\ because they are
+        in a different kernel phase or the write happens at a known point in
+        the control flow).
+
+  \item \textbf{Writes need to be visible across blocks on the same device?}
+        Use \texttt{\_\_threadfence()}.
+
+  \item \textbf{A GPU thread must signal the CPU?} Use\\
+        \texttt{\_\_threadfence\_system()}, but be aware of the transfer cost.
+\end{enumerate}
+
+\begin{ppnote}
+  \\\textbf{Student question:} Does using a memory fence introduce data races?\\[4pt]
+  \textbf{Instructor:} The fence itself does not introduce a data race --- it
+  makes the calling thread's past writes visible. However, the fence gives
+  you enough rope to hang yourself: it only flushes \emph{one} thread's
+  writes. If you assume that the fence simultaneously prevents another thread
+  from writing to the same location, you will have a race. Understanding
+  exactly what your workload requires is the programmer's responsibility.
+  ChatGPT and Claude will not do that reasoning for you.
+\end{ppnote}
+
+% ── 6.5 ──────────────────────────────────────────────────────────────────────
+\subsection{Practice Assignment: Producer--Consumer with Thread Fences}
+\label{subsec:assignment}
+
+The instructor concluded the synchronisation-primitives discussion with the
+following \textbf{ungraded practice assignment}:
+
+\begin{tcolorbox}[colback=blue!5,
+  title=\textbf{Practice Assignment (Ungraded)},fonttitle=\small\bfseries]
+  Write a simple \emph{producer--consumer} kernel using the different memory
+  fence primitives:
+  \begin{enumerate}[noitemsep]
+    \item Implement the pattern using \texttt{\_\_threadfence\_block()}.
+    \item Implement it using \texttt{\_\_threadfence()}.
+    \item Implement it using \texttt{\_\_threadfence\_system()}.
+  \end{enumerate}
+  Ensure each version is \emph{correct} (no data races). Then measure and
+  compare the execution times of the three versions. Articulate, in writing,
+  why one fence is more efficient than the others for this workload and what
+  the trade-off is between the scope of visibility and the overhead of the
+  fence operation.
+\end{tcolorbox}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\newpage
+\section*{End-of-Lecture Notes}
+\addcontentsline{toc}{section}{End-of-Lecture Notes}
+% ─────────────────────────────────────────────────────────────────────────────
+
+The instructor also announced that TAs would release a \textbf{practice
+problem set of 10 questions} on shared memory, \texttt{\_\_syncthreads()},
+and device synchronisation. Problems include tasks such as implementing a
+matrix transpose using shared memory. Students are encouraged to complete this
+set to consolidate the concepts from Lectures 15 and 16.
+
+\vspace{8pt}
+
+\begin{tcolorbox}[colback=gray!8,colframe=gray!50,
+  title=\textbf{Quick-Reference: Synchronisation Primitives (Slide 14)},
+  fonttitle=\small\bfseries]
+\begin{itemize}[noitemsep]
+  \item \textbf{\texttt{\_\_syncwarp()}} --- Warp-level barrier + fence.
+        Avoids the cost of a full block barrier when only one warp is involved.
+  \item \textbf{\texttt{\_\_syncthreads()}} --- Block-level barrier + fence.
+        All block threads must finish one phase before any may begin the next.
+        \emph{Do not use} inside divergent control flow, when threads are
+        independent, or when only one warp is active.
+  \item \textbf{\texttt{\_\_threadfence\_block()}} --- Memory fence: calling
+        thread's prior writes become visible to all threads of the block.
+  \item \textbf{\texttt{\_\_threadfence()}} --- Memory fence: calling thread's
+        prior writes become visible to all threads of the device.
+  \item \textbf{\texttt{\_\_threadfence\_system()}} --- Memory fence: calling
+        thread's prior writes become visible to all threads of the device
+        \emph{and} to the host. Most expensive; requires a device-to-host
+        transfer.
+\end{itemize}
+\end{tcolorbox}
