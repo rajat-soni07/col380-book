@@ -3,6 +3,342 @@
 \newcommand{\code}[1]{\texttt{#1}}
 \newcommand{\synct}{\code{\_\_syncthreads()}}
 
+\section{Introduction to GPUs and CUDA}
+
+Graphics Processing Units (GPUs) have emerged as a powerful platform for high-performance parallel computing. Originally designed for rendering graphics, modern GPUs are now widely used for general-purpose computation in domains such as scientific computing, machine learning, and large-scale data processing.
+
+\subsection{GPU vs CPU: Design Philosophy}
+
+The fundamental difference between CPUs and GPUs lies in their design goals. CPUs are optimized for executing a small number of threads with very low latency. This is achieved through sophisticated control logic, deep cache hierarchies, branch prediction, and out-of-order execution. In contrast, GPUs are designed to execute thousands of threads concurrently with high throughput. \cite{gpu_lecture}
+
+GPUs achieve this by:
+\begin{itemize}
+    \item Using a large number of simpler cores operating at lower clock speeds
+    \item Employing a Single Instruction Multiple Threads (SIMT) execution model
+    \item Reducing control complexity and cache size
+    \item Providing extremely high memory bandwidth (up to terabytes per second)
+\end{itemize}
+
+This architectural difference makes GPUs highly efficient for data-parallel workloads where the same operation is applied to many data elements simultaneously.
+
+\subsection{GPU Architecture Overview}
+
+A modern GPU consists of multiple Streaming Multiprocessors (SMs), each containing several processing cores, registers, shared memory, and specialized units such as tensor cores. The GPU is connected to the host CPU via high-speed interconnects such as PCI-Express. 
+
+Each SM executes groups of threads called \textit{warps}, typically consisting of 32 threads that execute instructions in lock-step. This execution model enables efficient utilization of hardware resources but also introduces challenges such as warp divergence when threads follow different execution paths.
+
+The memory hierarchy in GPUs includes:
+\begin{itemize}
+    \item Registers (per-thread, fastest)
+    \item Shared memory (per-block, low latency)
+    \item L1 and L2 caches
+    \item Global memory (high latency, large capacity)
+\end{itemize}
+
+Efficient GPU programming requires careful management of this memory hierarchy to maximize performance. 
+
+\subsection{GPU Model of Computation}
+
+GPU computation follows a heterogeneous programming model where execution is divided between the host (CPU) and the device (GPU). The host is responsible for orchestrating the computation, including memory allocation, data transfer, and kernel launches, while the device performs the actual parallel computation. \cite{cuda_lecture}
+
+The computation on the GPU is expressed in terms of \textit{kernels}, which are functions executed by many threads in parallel. Threads are organized hierarchically:
+\begin{itemize}
+    \item Threads form thread blocks
+    \item Thread blocks form a grid
+\end{itemize}
+
+Each thread performs a portion of the computation, enabling massive parallelism. Thread blocks are scheduled on Streaming Multiprocessors, and threads within a block can cooperate using shared memory. \cite{cuda_lecture}
+
+\subsection{Introduction to CUDA}
+
+CUDA (Compute Unified Device Architecture) is a parallel programming framework developed by NVIDIA that allows programmers to write code for GPUs using extensions to C/C++. CUDA provides an abstraction for managing the GPU execution model and memory hierarchy.
+
+In CUDA, programs consist of:
+\begin{itemize}
+    \item Host code: Runs on the CPU and manages execution
+    \item Device code: Runs on the GPU as kernels
+\end{itemize}
+
+Kernel execution is initiated by the host and executed asynchronously on the device. Multiple kernels can be launched concurrently using streams, enabling overlap of computation and data transfer. \cite{cuda_lecture}
+
+\subsection{Execution Workflow}
+
+A typical CUDA program follows these steps:
+\begin{enumerate}
+    \item Allocate memory on the device
+    \item Transfer data from host to device
+    \item Launch kernel with specified grid and block dimensions
+    \item Execute computation in parallel on the GPU
+    \item Transfer results back to the host
+\end{enumerate}
+
+This workflow highlights the importance of data movement and parallel execution in GPU computing.
+
+\subsection{Summary}
+
+GPUs provide a massively parallel architecture optimized for throughput-oriented workloads. CUDA enables developers to harness this computational power through a structured programming model that separates host and device responsibilities. Understanding the architectural principles and execution model of GPUs is essential for writing efficient parallel programs.
+\newpage
+\section{CUDA Basics}
+
+CUDA (Compute Unified Device Architecture) provides a programming model that enables developers to utilize the massive parallelism offered by GPUs. In this section, we introduce the fundamental concepts required to understand CUDA programming.
+
+\subsection{Kernels}
+
+A \textit{kernel} is the basic unit of execution on the GPU. It is a function that is executed in parallel by a large number of threads on the device. Kernels are defined using the \texttt{\_\_global\_\_} qualifier, indicating that they run on the GPU but are invoked from the host (CPU). \cite{cuda_lecture}
+
+\begin{lstlisting}[language=C++]
+__global__ void vector_add(const float *A, const float *B, float *C, int N)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < N)
+        C[i] = A[i] + B[i];
+}
+\end{lstlisting}
+
+The conditional check \texttt{if (i < N)} is necessary because the total number of threads launched is often rounded up to cover all data elements. As a result, some threads may compute indices beyond the valid range of the input arrays. This check prevents out-of-bounds memory access, ensuring correctness and avoiding undefined behavior.
+
+\subsection{Thread Hierarchy}
+
+CUDA organizes threads in a hierarchical structure to enable scalable parallelism:
+
+\begin{itemize}
+    \item \textbf{Thread:} Smallest unit of execution. Each thread performs a portion of the computation.
+    \item \textbf{Block:} A group of threads that can cooperate via shared memory and synchronize with each other.
+    \item \textbf{Grid:} A collection of thread blocks executing the same kernel.
+\end{itemize}
+
+\subsection{Thread Indexing}
+
+In CUDA, each thread is uniquely identified using built-in variables such as \texttt{threadIdx}, \texttt{blockIdx}, and \texttt{blockDim}. These variables allow mapping each thread to a specific portion of the data.
+
+Within a block, threads are indexed using \texttt{threadIdx.x}, which ranges from $0$ to $\texttt{blockDim.x} - 1$. Similarly, each block in a grid is identified by \texttt{blockIdx.x}.
+
+To compute a unique global index for each thread across all blocks, the following formula is used:
+
+\begin{equation}
+\text{index} = \texttt{threadIdx.x} + \texttt{blockIdx.x} \times \texttt{blockDim.x}
+\end{equation}
+
+This formula ensures that:
+\begin{itemize}
+    \item Threads within a block access consecutive indices
+    \item Different blocks process different portions of the data
+\end{itemize}
+
+For example, if each block contains 8 threads and there are multiple blocks, then:
+\begin{itemize}
+    \item Block 0 handles indices $0$ to $7$
+    \item Block 1 handles indices $8$ to $15$
+    \item Block 2 handles indices $16$ to $23$, and so on
+\end{itemize}
+
+This indexing scheme enables scalable parallelization, allowing CUDA programs to efficiently distribute work across thousands of threads.
+
+
+\subsection{Execution Model}
+
+CUDA follows a heterogeneous execution model where:
+
+\begin{itemize}
+    \item The \textbf{host (CPU)} manages memory allocation, data transfers, and kernel launches.
+    \item The \textbf{device (GPU)} executes kernels in parallel.
+\end{itemize}
+
+Kernel launches are asynchronous by default, meaning the CPU does not wait for GPU execution to complete unless explicitly synchronized.
+
+\subsection{Kernel Invocation}
+
+Kernels are launched from the host using the following syntax:
+
+\begin{lstlisting}[language=C++]
+int threads_per_block = 256;
+int blocks = (N + threads_per_block - 1) / threads_per_block;
+
+vector_add<<<blocks, threads_per_block>>>(d_A, d_B, d_C, N);
+cudaDeviceSynchronize();
+\end{lstlisting}
+
+Here:
+\begin{itemize}
+    \item \texttt{threads\_per\_block} defines the number of threads in each block.
+    \item \texttt{blocks} defines the number of blocks in the grid.
+    \item \texttt{cudaDeviceSynchronize()} ensures that the host waits for GPU execution to complete.
+\end{itemize}
+
+\subsection{Memory Management}
+
+CUDA provides explicit control over memory allocation and data transfer between host and device.
+
+\begin{lstlisting}[language=C++]
+// Device memory allocation
+cudaMalloc(&d_A, bytes);
+cudaMalloc(&d_B, bytes);
+cudaMalloc(&d_C, bytes);
+
+// Copy data from host to device
+cudaMemcpy(d_A, h_A, bytes, cudaMemcpyHostToDevice);
+cudaMemcpy(d_B, h_B, bytes, cudaMemcpyHostToDevice);
+
+// Copy results back to host
+cudaMemcpy(h_C, d_C, bytes, cudaMemcpyDeviceToHost);
+\end{lstlisting}
+
+Data transfers between host and device are relatively expensive and should be minimized for better performance.
+
+\subsection{Device Qualifiers}
+
+CUDA uses special qualifiers to specify where functions execute and where they are called from:
+
+\begin{itemize}
+    \item \texttt{\_\_global\_\_}: Executed on the device, called from the host (used for kernels)
+    \item \texttt{\_\_device\_\_}: Executed and called on the device (helper functions)
+    \item \texttt{\_\_host\_\_}: Executed on the host (default C/C++ functions)
+\end{itemize}
+
+\subsection{Memory Types}
+
+CUDA provides different memory spaces with varying scope and performance characteristics:
+
+\begin{itemize}
+    \item \textbf{Registers:} Fastest, private to each thread
+    \item \textbf{Shared Memory:} Fast, shared among threads in a block
+    \item \textbf{Global Memory:} Large but high latency, accessible by all threads
+    \item \textbf{Constant Memory:} Read-only, cached memory for constant data
+\end{itemize}
+
+Efficient utilization of these memory types is crucial for achieving high performance.
+
+\subsection{Summary}
+
+CUDA abstracts the complexity of GPU programming through kernels, thread hierarchies, and explicit memory management. By organizing computation into grids, blocks, and threads, and carefully managing memory and synchronization, developers can exploit the massive parallelism offered by modern GPUs.
+
+\subsection{Exercises}
+\begin{ppexercises}
+
+\ppexercise{%
+\textbf{GPU Architecture and SIMT:}
+Consider a GPU where each Streaming Multiprocessor (SM) handles warps of 32 threads.
+
+\begin{enumerate}[label=(\alph*)]
+\item Explain the concept of \textit{warp divergence}. What happens to the execution throughput when an \texttt{if-else} statement causes half the threads in a warp to take one path and the other half to take another?
+\item Why does the GPU architecture prefer many simple cores over a few complex cores like a CPU?
+\item If a kernel is launched with a block size of 40 threads, how many warps are scheduled for that block? Justify your answer.
+\end{enumerate}
+}
+
+\ppexercise{%
+\textbf{Thread Indexing and Mapping:}
+A programmer wants to process a 1D array of size N=1000. They decide to use a block size (\texttt{blockDim.x}) of 256 threads.
+
+\begin{enumerate}[label=(\alph*)]
+\item Calculate the minimum number of blocks required to cover all elements.
+\item Provide the specific CUDA kernel launch syntax (the \texttt{<<<...>>>} part) for this configuration.
+\item Inside the kernel, a thread belongs to \texttt{blockIdx.x = 2} and has \texttt{threadIdx.x = 10}. What is the global index i this thread will calculate?
+\item Explain why the condition \texttt{if (i < N)} is strictly necessary in this specific scenario.
+\end{enumerate}
+}
+
+\ppexercise{%
+\textbf{Memory Hierarchy and Latency:}
+CUDA programmers must choose between Global, Shared, and Register memory.
+
+\begin{enumerate}[label=(\alph*)]
+\item Arrange the three memory types (Global, Shared, Registers) in order of increasing capacity and increasing latency.
+\item In a vector addition kernel (C=A+B), the variables A,B, and C are stored in Global Memory. If the kernel is limited by the time it takes to fetch these values, is it "compute-bound" or "memory-bound"?
+\item Why is \texttt{cudaMemcpy} considered a potential bottleneck in a heterogeneous computing workflow?
+\end{enumerate}
+}
+
+\end{ppexercises}
+
+\subsection*{Solutions}
+
+\subsubsection{Solution 1}
+
+\begin{enumerate}[label=(\alph*)]
+\item \textbf{Warp Divergence:} Since threads in a warp execute in lock-step (SIMT), if they diverge, the hardware must serialize the paths. It executes the \texttt{if} path while masking the \texttt{else} threads, then vice versa. This can drop throughput by up to 50% in this specific case.
+\item \textbf{Throughput vs. Latency:} CPUs use complex logic to minimize the latency of a single thread. GPUs sacrifice per-thread latency and complex logic to maximize total throughput, using the area to pack more arithmetic units (ALUs).
+\item \textbf{Warp Scheduling:} 2 warps. Warps are always allocated in groups of 32 threads. 40/32=1.25, which rounds up to 2 warps (64 slots total, with 24 threads being inactive).
+\end{enumerate}
+
+\subsubsection{Solution 2}
+% \begin{enumerate}[label=(\alph*)]
+% \item \textbf{Number of Blocks.} To find the number of blocks B required for an array of size N with a block size T, we use the ceiling division:
+
+
+% \item \textbf{Kernel Launch Syntax.} Using the calculated dimensions (4 blocks, 256 threads):
+% \begin{lstlisting}[language=C++]
+% // Launching the kernel with 4 blocks of 256 threads each
+% vector_add<<<4, 256>>>(d_A, d_B, d_C, N);
+% \end{lstlisting}
+
+% \item \textbf{Global Index Calculation.} The unique global index i is calculated using the formula:
+% \begin{align*}
+% i &= \text{threadIdx.x} + (\text{blockIdx.x} \times \text{blockDim.x}) \
+% \end{align*}
+% \begin{align*}
+% i &= 10 + (2 \times 256) \ = 10 + 512 = \mathbf{522}.
+% \end{align*}
+    
+
+% \item \textbf{Necessity of Boundary Guards.}
+% With 4 blocks of 256 threads, the GPU launches a total of 4×256=1024 threads. Since the array size N is only 1000, threads with global indices i belongs to [1000,1023] would attempt to access memory beyond the allocated bounds of the arrays. The \texttt{if (i < N)} guard ensures these "extra" threads remain idle, preventing memory corruption or undefined behavior.
+% \end{enumerate}
+
+\begin{enumerate}[label=(\alph*)]
+  \item \textbf{Number of Blocks.} To find the number of blocks B required for an array of size N with a block size T, we use the ceiling division: B = 1000/256 == 4.
+
+\item \textbf{Kernel Launch Syntax.} Using the calculated dimensions (4 blocks, 256 threads):
+\begin{lstlisting}[language=C++]
+// Launching the kernel with 4 blocks of 256 threads each
+vector_add<<<4, 256>>>(d_A, d_B, d_C, N);
+\end{lstlisting}
+
+\item \textbf{Global Index Calculation.} The unique global index i is calculated using the formula:
+        \begin{align*}
+          i &= \text{threadIdx.x} + (\text{blockIdx.x} \times \text{blockDim.x}) \
+        \end{align*}
+        \begin{align*}
+            i &= 10 + (2 \times 256) = 10 + 512 = \mathbf{522}
+        \end{align*}
+
+\item \textbf{Necessity of Boundary Guards.}
+With 4 blocks of 256 threads, the GPU launches a total of 4×256=1024 threads. Since the array size N is only 1000, threads with global indices i belongs in [1000,1023] would attempt to access memory beyond the allocated bounds of the arrays. The \texttt{if (i < N)} guard ensures these "extra" threads remain idle, preventing memory corruption or undefined behavior.
+\end{enumerate}
+
+\subsubsection{Solution 3}
+\begin{enumerate}[label=(\alph*)]
+\item \textbf{Hierarchy:}
+\begin{itemize}
+\item \textbf{Capacity:} Registers < Shared Memory < Global Memory
+\item \textbf{Latency:} Registers < Shared Memory < Global Memory
+\end{itemize}
+\item \textbf{Bottleneck:} It is \textbf{memory-bound}. The performance is limited by the high latency and bandwidth limits of Global Memory rather than the speed of the floating-point units.
+\item \textbf{PCIe Overhead:} Data must travel over the PCIe bus, which has much lower bandwidth than the GPU's internal memory. Moving data often takes longer than the actual calculation.
+\end{enumerate}
+\newpage
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Revisiting the Memory Hierarchy}
+\label{sec:memory-hierarchy}
+% ─────────────────────────────────────────────────────────────────────────────
+
+Before delving into the intricacies of shared-memory programming, it is imperative to briefly revisit the memory hierarchy of a modern GPU. Understanding the distinct memory spaces, their physical locations, and their accessibility scopes is crucial for writing performant CUDA kernels.
+
+The GPU memory architecture comprises several distinct layers, ranging from small, exceptionally fast on-chip memory to large, high-latency off-chip memory:
+l
+\begin{itemize}
+    \item \textbf{Registers:} These are strictly on-chip and are private to each individual thread. They offer the lowest latency and highest bandwidth of all memory spaces.
+    
+    \item \textbf{Shared memory:} This is a fast, on-chip memory space that is shared by all threads residing within the \textbf{same block}. Because it is explicitly managed by the programmer, it serves as a highly efficient block-level scratch-pad.
+    
+    \item \textbf{L1 Cache/ Read-only Cache/ Texture Cache:} These are on-chip memory structures managed entirely by the hardware. They help buffer global memory accesses and exploit spatial and temporal locality without explicit programmer intervention.
+    
+    \item \textbf{L2 Cache:} This is a large on-chip cache that serves as a unified backing store, shared across all Streaming Multiprocessors (SMs).
+    
+    \item \textbf{Global Memory:} This is the largest memory space available on the device, but it is also markedly slow. Data that must be persistent across kernel launches or is too large to fit in on-chip memory resides here.
+\end{itemize}
+\newpage
 \section{Shared-Memory Usage}
 
 
@@ -616,7 +952,7 @@ __global__ void stencil_2d(const float *A, float *B,
         in 2-D, as the set of writes that must be flushed before computation
         begins is significantly larger.
 \end{enumerate}
-
+\newpage
 \section{Common Mistakes in Shared Memory}
 \label{sec:common-mistakes}
 % ─────────────────────────────────────────────────────────────────────────────
@@ -1185,10 +1521,184 @@ following \textbf{ungraded practice assignment}:
   fence operation.
 \end{tcolorbox}
 
+\subsection{Exercises}
+\begin{ppexercises}
+
+\ppexercise{%
+  \textbf{Common Mistakes --- Identification:} For each of the four kernel snippets below, identify \emph{which} common shared-memory mistake (if any) is present and briefly explain the consequence.
+
+  \begin{enumerate}[label=(\alph*)]
+    \item A kernel copies each element of a global array into shared memory, reads it back once, and writes the result directly to a second global array. No element is read by more than one thread.
+    \item A kernel loads a tile of a matrix into shared memory and then immediately (without any barrier) uses those shared-memory values to compute a dot product.
+    \item Each block allocates \ppinline{\_\_shared\_\_ float buf[32768];} (128\,KB) on an SM that has only 48\,KB of shared memory per SM.
+    \item Threads in a warp access \ppinline{sA[threadIdx.x * 32]} (stride-32 access into a 32-bank shared-memory array).
+  \end{enumerate}
+}
+
+\ppexercise{%
+  \textbf{Synchronisation Primitive Selection:} For each scenario, choose the \emph{most appropriate} CUDA synchronisation primitive from the list
+  \{\ppinline{\_\_syncwarp()}, \ppinline{\_\_syncthreads()}, \ppinline{\_\_threadfence\_block()}, \ppinline{\_\_threadfence()}, \ppinline{\_\_threadfence\_system()}\}
+  and justify your choice.
+
+  \begin{enumerate}[label=(\alph*)]
+    \item All 256 threads of a block cooperatively fill a shared-memory tile in Phase~1 and then read from it in Phase~2.
+    \item Only the 32 threads of the first warp participate in a warp-level prefix sum using shared memory.
+    \item Thread~0 of a block writes a ``done'' flag into shared memory. Other threads in the \emph{same block} will poll that flag later in the kernel, but no barrier rendezvous is needed or desired.
+    \item Block~0 computes a partial result and writes it to a global variable. Block~1 must read that global variable \emph{after} Block~0 has written it (within a single kernel launch, assuming cooperative groups are not used).
+    \item A GPU thread writes a result to pinned (page-locked) host memory that the CPU will read immediately after a host-side polling loop.
+  \end{enumerate}
+}
+
+\ppexercise{%
+  \textbf{Divergent \texttt{\_\_syncthreads()} and Fix:} Consider the following kernel intended to perform two different shared-memory operations depending on thread index (Code is given below):
+
+
+
+  \begin{enumerate}[label=(\alph*)]
+    \item Explain precisely why this kernel is incorrect. Which of the four common shared-memory mistakes does it illustrate?
+    \item Will the kernel always hang, or only sometimes? Explain.
+    \item Rewrite the kernel so that it is correct: both halves of the computation are performed, no thread is left waiting at an unsatisfiable barrier, and the intended shared-memory reads are safe.
+  \end{enumerate}
+}
+
+\end{ppexercises}
+\begin{lstlisting}[language=C++]
+__global__ void broken_kernel(float *A, float *B, float *C, int N) {
+    __shared__ float s[256];
+    int tx = threadIdx.x;
+    int i  = blockIdx.x * blockDim.x + tx;
+
+    if (tx < 128) {
+        s[tx] = A[i];
+        __syncthreads();          // (X)
+        C[i] = s[tx] + s[tx + 1];
+    } else {
+        s[tx] = B[i];
+        __syncthreads();          // (Y)
+        C[i] = s[tx] + s[tx - 1];
+    }
+}
+\end{lstlisting}
+\section*{Solutions}
+
+\subsubsection{Solution 1}
+
+\begin{enumerate}[label=(\alph*)]
+  \item \textbf{Mistake~1 --- No data reuse.}  Each shared-memory slot is written
+        by exactly one thread and read by exactly one thread (the same thread).
+        There is zero reuse across threads, so staging the data in shared memory
+        provides no performance benefit and wastes on-chip capacity.
+
+  \item \textbf{Mistake~2 --- Missing \ppinline{\_\_syncthreads()}.}  The tile
+        load and the dot-product computation are in the same phase with no barrier
+        between them.  A thread may begin reading shared-memory values written by
+        \emph{other} threads before those writes have completed, producing a race
+        condition and incorrect results.
+
+  \item \textbf{Mistake~3 --- Excessive shared memory per block.}  128\,KB exceeds
+        the SM's 48\,KB pool entirely; the kernel will fail to launch
+        (\ppinline{cudaErrorInvalidValue} or similar).  Even if the request were
+        smaller but still large relative to the pool, it would drastically reduce
+        the number of blocks that can co-reside on the SM, lowering occupancy and
+        throughput.
+
+  \item \textbf{Mistake~4 --- Bank conflict.}  With 32 banks and a stride of 32,
+        every thread in the warp maps to \emph{bank 0} (since
+        $(\texttt{threadIdx.x} \times 32) \bmod 32 = 0$ for all threads).  This
+        is a 32-way conflict: the 32 accesses are fully serialised, eliminating
+        all shared-memory bandwidth benefit.
+\end{enumerate}
+
+\subsubsection{Solution 2}
+
+\begin{enumerate}[label=(\alph*)]
+  \item \ppinline{\_\_syncthreads()}.  All 256 threads participate, the computation
+        is phased (fill then read), and every thread must have completed its write
+        before any thread begins reading.  A block-wide barrier + fence is required.
+
+  \item \ppinline{\_\_syncwarp()}.  Only 32 threads (one warp) are involved.
+        \ppinline{\_\_syncthreads()} would also be correct but wastes cycles
+        synchronising the other warps in the block that are not participating.
+        \ppinline{\_\_syncwarp()} provides the same barrier + fence guarantee at
+        warp scope for a fraction of the cost.
+
+  \item \ppinline{\_\_threadfence\_block()}.  A full barrier is not desired
+        (other threads should not stall).  Only thread~0's write needs to become
+        visible to the rest of the block.  \ppinline{\_\_threadfence\_block()}
+        flushes thread~0's write to block-scope visibility without blocking
+        execution of any thread.
+
+  \item \ppinline{\_\_threadfence()}.  The write must be visible across thread
+        \emph{blocks} on the same device.  \ppinline{\_\_syncthreads()} only
+        synchronises within one block and cannot coordinate between blocks.
+        \ppinline{\_\_threadfence()} makes the calling thread's writes visible
+        device-wide.  (Note: even with the fence, the programmer must ensure
+        that Block~1 reads the variable \emph{after} Block~0 has written and
+        fenced it --- ordering between blocks requires additional signalling
+        logic such as an atomic flag.)
+
+  \item \ppinline{\_\_threadfence\_system()}.  The write must cross the PCIe bus
+        and become visible to the \emph{host CPU}.
+        \ppinline{\_\_threadfence()} only guarantees device-scope visibility;
+        \ppinline{\_\_threadfence\_system()} is the only primitive that flushes
+        GPU write buffers all the way into host-visible memory.  It is expensive
+        and should be used sparingly.
+\end{enumerate}
+
+\subsubsection{Solution 3}
+
+\begin{enumerate}[label=(\alph*)]
+  \item The kernel places \ppinline{\_\_syncthreads()} inside a divergent
+        \ppinline{if}-\ppinline{else} branch.  Threads~0--127 reach barrier~(X)
+        inside the \ppinline{then} branch; threads~128--255 reach barrier~(Y)
+        inside the \ppinline{else} branch.  \ppinline{\_\_syncthreads()} requires
+        \emph{all} threads in the block to arrive at the \emph{same} barrier
+        instance.  Because the two groups arrive at \emph{different} barrier
+        instances, the condition can never be satisfied.  This is
+        \textbf{Mistake~2} (missing/misused \ppinline{\_\_syncthreads()}) combined
+        with the specific sub-case of divergent control flow.
+
+  \item On most GPU generations the kernel will \textbf{hang} (deadlock)
+        deterministically, not just sometimes.  The CUDA specification states that
+        placing \ppinline{\_\_syncthreads()} in divergent code results in undefined
+        behaviour; in practice, the SM stalls waiting for a barrier that is never
+        collectively reached.
+
+  \item The fix is to move both stores \emph{before} a single, unconditional
+        barrier and then move the divergent reads \emph{after} it:
+
+\begin{lstlisting}[language=C++]
+__global__ void fixed_kernel(float *A, float *B, float *C, int N) {
+    __shared__ float s[256];
+    int tx = threadIdx.x;
+    int i  = blockIdx.x * blockDim.x + tx;
+
+    // Phase 1: all threads write to shared memory (no divergence)
+    if (tx < 128)
+        s[tx] = A[i];
+    else
+        s[tx] = B[i];
+
+    // Single unconditional barrier: all 256 writes must complete
+    __syncthreads();
+
+    // Phase 2: divergent reads are now safe
+    if (tx < 128)
+        C[i] = s[tx] + s[tx + 1];
+    else
+        C[i] = s[tx] + s[tx - 1];
+}
+\end{lstlisting}
+
+        The single \ppinline{\_\_syncthreads()} is now reached unconditionally by
+        all threads; Phase~1 stores by both halves of the block are guaranteed
+        visible before any Phase~2 read executes.
+\end{enumerate}
+
 % ─────────────────────────────────────────────────────────────────────────────
 \newpage
-\section*{End-of-Lecture Notes}
-\addcontentsline{toc}{section}{End-of-Lecture Notes}
+\section{End-of-Lecture Notes}
+
 % ─────────────────────────────────────────────────────────────────────────────
 
 The instructor also announced that TAs would release a \textbf{practice
@@ -1219,3 +1729,38 @@ set to consolidate the concepts from Lectures 15 and 16.
         transfer.
 \end{itemize}
 \end{tcolorbox}
+\newpage
+\section {References}
+\begin{itemize}
+    \item COL 380 - Subodh Sharma, \textit{Introduction to Parallel and Distributed Programming}, Course slides.
+    \item Ruud van der Pas, \textit{Tasking in OpenMP}, SC13 Tutorial Slides, OpenMP Architecture Review Board. \url{https://www.openmp.org/wp-content/uploads/sc13.tasking.ruud.pdf}
+    \item Ananth Grama, Georg Karypis, Vipin Kumar, and Anshul Gupta, \textit{Introduction to Parallel Computing}, Addison-Wesley.
+    \item Subodh Kumar, \textit{Introduction to Parallel Programming}, Lecture Notes.
+    \item Peter S. Pacheco, \textit{An Introduction to Parallel Programming}, Morgan Kaufmann.
+\end{itemize}
+
+\section{Contribution Statement}
+
+\begin{itemize}
+    \item \textbf{Rajat Soni (2023CS10229)} \begin{itemize}
+        \item Documented the Shared memory usage part (Slides 8--10).
+        \item Wrote Excercise and Solutions for the shared memory usage part.
+        \item Developed a comprehensive verbatim transcript of the lecture.
+        \item Compiled and formatted all bibliographic references.
+    \end{itemize}
+    \item \textbf{Chunduru Yagneshwara Naga Venkata Hanumath (2022CS11608)}
+    \begin{itemize}
+        \item Written the Introduction to CUDA and GPU (Slides 1--7)
+        \item Documented the basics in CUDA
+        \item Given examples for getting hands on cuda basics.
+    \end{itemize}
+     \item \textbf{Ujjawal Sharma (2022CS51137)}   \begin{itemize}
+        \item Documented the Common Mistakes with Shared Memory. (Section 3.5) (Slide 11).
+        \item Wrote and Explained Synchronisation Primitives with examples (Section 3.6) (Slides 12--14).
+        \item Mentioned relevant class discussions and Wrote Exercises and Solutions for deep understanding.
+    \end{itemize}
+     \item \textbf{A. Sai Srinivas (2022CS11620)}   \begin{itemize}
+        \item Wrote the Section Revisiting the Memory Hierarchy (Slide 7).
+    \end{itemize}
+    
+\end{itemize}
